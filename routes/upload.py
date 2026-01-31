@@ -5,7 +5,7 @@ File upload and download endpoints.
 import logging
 from pathlib import Path
 
-from fastapi import APIRouter, HTTPException, UploadFile, File, BackgroundTasks
+from fastapi import APIRouter, HTTPException, BackgroundTasks, Request
 from fastapi.responses import FileResponse
 
 from models.schemas import JobStatus, UploadResponse
@@ -21,11 +21,13 @@ router = APIRouter()
 @router.put("/upload/{job_id}", response_model=UploadResponse)
 async def upload_training_data(
     job_id: str,
-    file: UploadFile = File(...),
+    request: Request,
     background_tasks: BackgroundTasks = None,
 ):
     """
     Upload training data (ZIP file) for a job.
+
+    Accepts raw bytes with Content-Type: application/zip (or multipart/form-data).
 
     The ZIP should contain:
     - transforms.json: Camera transforms in NeRF format
@@ -45,12 +47,12 @@ async def upload_training_data(
     # Update status to uploading
     job_manager.update_job_status(job_id, JobStatus.uploading)
 
-    # Read file content
+    # Read raw bytes from request body
     try:
-        content = await file.read()
+        content = await request.body()
     except Exception as e:
         job_manager.update_job_status(job_id, JobStatus.failed, error_message=str(e))
-        raise HTTPException(status_code=400, detail=f"Failed to read file: {e}")
+        raise HTTPException(status_code=400, detail=f"Failed to read request body: {e}")
 
     # Check size
     if len(content) > MAX_UPLOAD_SIZE:
@@ -64,8 +66,15 @@ async def upload_training_data(
             detail=f"File too large. Max size: {MAX_UPLOAD_SIZE / 1024 / 1024:.0f} MB",
         )
 
-    # Save the file
-    filename = file.filename or "upload.zip"
+    # Get filename from Content-Disposition header or default
+    content_disposition = request.headers.get("Content-Disposition", "")
+    filename = "upload.zip"
+    if "filename=" in content_disposition:
+        # Parse filename from header (e.g., 'attachment; filename="data.zip"')
+        try:
+            filename = content_disposition.split("filename=")[1].strip('"').strip("'")
+        except (IndexError, AttributeError):
+            pass  # Keep default filename
     file_path = await storage_service.save_upload(job_id, content, filename)
 
     # Extract if ZIP

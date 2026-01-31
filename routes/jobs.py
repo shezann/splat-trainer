@@ -23,6 +23,42 @@ from services.storage import storage_service
 router = APIRouter()
 
 
+@router.get("/downloads")
+async def list_available_downloads(
+    limit: int = Query(50, ge=1, le=100, description="Max results"),
+):
+    """
+    List all completed training jobs with their download URLs.
+
+    This endpoint allows any client to browse and download available splats
+    without needing to track individual job IDs.
+    """
+    # Get all completed jobs
+    jobs = job_manager.list_jobs(status=JobStatus.completed, limit=limit)
+
+    downloads = []
+    for job in jobs:
+        result_path = storage_service.get_final_result(job.id)
+        if result_path and result_path.exists():
+            file_size = result_path.stat().st_size
+            downloads.append({
+                "jobId": job.id,
+                "scanId": job.scan_id,
+                "name": job.scan_id or job.id,
+                "downloadURL": f"/download/{job.id}",
+                "fileSize": file_size,
+                "fileSizeMB": round(file_size / 1024 / 1024, 2),
+                "completedAt": job.updated_at.isoformat() if job.updated_at else None,
+                "createdAt": job.created_at.isoformat() if job.created_at else None,
+                "quality": job.config.quality_preset if job.config else "balanced",
+            })
+
+    return {
+        "downloads": downloads,
+        "count": len(downloads),
+    }
+
+
 @router.post("", response_model=JobCreateResponse, status_code=201)
 async def create_job(request: JobCreateRequest = None):
     """
