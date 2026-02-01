@@ -175,6 +175,11 @@ class GaussianSplatTrainer:
             # Initialize Gaussian parameters
             params = self._init_gaussians(init_points, preset.get("sh_degree", 3))
             logger.info(f"Initialized {params.num_gaussians()} Gaussians")
+            logger.info(
+                f"Initial positions: min={params.means.min().item():.4f}, "
+                f"max={params.means.max().item():.4f}, "
+                f"mean={params.means.mean().item():.4f}"
+            )
 
             # Setup optimizer with per-parameter learning rates
             optimizer = self._create_optimizer(params)
@@ -306,6 +311,14 @@ class GaussianSplatTrainer:
 
             # Save final result
             self._log_system_status()
+            logger.info(
+                f"Final positions: min={params.means.min().item():.4f}, "
+                f"max={params.means.max().item():.4f}"
+            )
+            logger.info(
+                f"Final scales: min={params.scales.min().item():.4f}, "
+                f"max={params.scales.max().item():.4f}"
+            )
             final_path = output_dir / "point_cloud.ply"
             if self._save_ply(final_path, params):
                 logger.info(f"Saved final result: {final_path}")
