@@ -47,9 +47,15 @@ async def upload_training_data(
     # Update status to uploading
     job_manager.update_job_status(job_id, JobStatus.uploading)
 
+    # Log incoming request details for debugging
+    content_type = request.headers.get("Content-Type", "unknown")
+    content_length = request.headers.get("Content-Length", "unknown")
+    logger.info(f"Upload request for job {job_id}: Content-Type={content_type}, Content-Length={content_length}")
+
     # Read raw bytes from request body
     try:
         content = await request.body()
+        logger.info(f"Read {len(content)} bytes from request body")
     except Exception as e:
         job_manager.update_job_status(job_id, JobStatus.failed, error_message=str(e))
         raise HTTPException(status_code=400, detail=f"Failed to read request body: {e}")

@@ -1,17 +1,20 @@
 """
-3D Gaussian Splatting training service.
-Wraps gsplat/OpenSplat for training models from iOS scan data.
+3D Gaussian Splatting training service using gsplat.
+Implements real differentiable Gaussian splatting for scene reconstruction.
 """
 
 import asyncio
-import subprocess
-import json
 import logging
-import re
+import math
+import random
+import shutil
+import time
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional, Callable, Dict, Any
-from dataclasses import dataclass
-from datetime import datetime
+from typing import Optional, Callable, Dict, Any, List
+
+import numpy as np
+import torch
 
 from config import CHECKPOINT_ITERATIONS, QUALITY_PRESETS
 
@@ -29,15 +32,35 @@ class TrainingProgress:
     elapsed_seconds: Optional[float] = None
 
 
+@dataclass
+class GaussianParams:
+    """Container for Gaussian splat parameters."""
+    means: torch.Tensor       # (N, 3) positions
+    scales: torch.Tensor      # (N, 3) log-scales
+    quats: torch.Tensor       # (N, 4) quaternions (wxyz)
+    opacities: torch.Tensor   # (N,) logit-opacities
+    sh0: torch.Tensor         # (N, 3) DC spherical harmonics (color)
+    sh_rest: Optional[torch.Tensor] = None  # (N, K, 3) higher-order SH
+
+    def num_gaussians(self) -> int:
+        return self.means.shape[0]
+
+    def get_params_list(self) -> List[torch.Tensor]:
+        """Get list of all parameter tensors."""
+        params = [self.means, self.scales, self.quats, self.opacities, self.sh0]
+        if self.sh_rest is not None:
+            params.append(self.sh_rest)
+        return params
+
+
 class GaussianSplatTrainer:
     """
-    Wrapper for 3D Gaussian Splatting training.
-    Supports multiple backends: gsplat, OpenSplat, or custom.
+    3D Gaussian Splatting trainer using gsplat for differentiable rendering.
     """
 
     def __init__(self):
-        self.process: Optional[subprocess.Popen] = None
         self.cancelled = False
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     async def train(
         self,
@@ -65,21 +88,19 @@ class GaussianSplatTrainer:
         self.cancelled = False
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        # Get preset configuration
         preset = QUALITY_PRESETS.get(quality_preset, QUALITY_PRESETS["balanced"])
 
-        # Find training data
+        # Find transforms.json
         transforms_path = self._find_transforms(data_dir)
         if transforms_path is None:
             raise ValueError(f"No transforms.json found in {data_dir}")
 
         actual_data_dir = transforms_path.parent
 
-        logger.info(f"Starting training: {actual_data_dir} -> {output_dir}")
-        logger.info(f"Config: {iterations} iterations, preset={quality_preset}")
+        logger.info(f"Starting gsplat training: {actual_data_dir} -> {output_dir}")
+        logger.info(f"Device: {self.device}, iterations: {iterations}, preset: {quality_preset}")
 
-        # Try different training backends
-        result = await self._train_with_gsplat(
+        result = await self._train_gsplat(
             actual_data_dir,
             output_dir,
             iterations,
@@ -91,17 +112,15 @@ class GaussianSplatTrainer:
 
     def _find_transforms(self, data_dir: Path) -> Optional[Path]:
         """Find transforms.json in the data directory."""
-        # Direct path
         if (data_dir / "transforms.json").exists():
             return data_dir / "transforms.json"
 
-        # Search in subdirectories
         for path in data_dir.rglob("transforms.json"):
             return path
 
         return None
 
-    async def _train_with_gsplat(
+    async def _train_gsplat(
         self,
         data_dir: Path,
         output_dir: Path,
@@ -110,321 +129,482 @@ class GaussianSplatTrainer:
         progress_callback: Optional[Callable[[TrainingProgress], None]],
     ) -> Dict[str, Any]:
         """
-        Train using gsplat library (Python-based training).
+        Train Gaussians using gsplat library.
         """
-        # Create training script
-        train_script = output_dir / "train.py"
-        self._write_training_script(train_script, data_dir, output_dir, iterations, preset)
-
-        # Run training
-        cmd = ["python", str(train_script)]
-
-        logger.info(f"Running: {' '.join(cmd)}")
-
-        self.process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-        )
+        from services.camera_utils import load_training_data
+        from services.loss_utils import combined_loss, compute_psnr
 
         result = {
             "success": False,
             "iterations_completed": 0,
             "final_loss": None,
+            "final_psnr": None,
+            "num_gaussians": 0,
             "output_path": None,
             "error": None,
         }
 
+        start_time = time.time()
+
         try:
-            # Monitor output
-            async for progress in self._monitor_training(iterations):
+            # Import gsplat
+            try:
+                from gsplat.rendering import rasterization
+                from gsplat.strategy import DefaultStrategy
+            except ImportError as e:
+                logger.error(f"gsplat not available: {e}")
+                raise ImportError(
+                    "gsplat library not installed. Install with: pip install gsplat"
+                ) from e
+
+            # Load training data
+            logger.info("Loading training data...")
+            data = load_training_data(data_dir, device=self.device, image_scale=0.5)
+
+            viewmats = data["viewmats"]  # (N, 4, 4)
+            Ks = data["Ks"]              # (N, 3, 3)
+            images = data["images"]       # (N, H, W, 3)
+            init_points = data["initial_points"]
+            width = data["width"]
+            height = data["height"]
+
+            num_images = len(images)
+            logger.info(f"Loaded {num_images} images at {width}x{height}")
+            logger.info(f"Initial points: {len(init_points)}")
+
+            # Initialize Gaussian parameters
+            params = self._init_gaussians(init_points, preset.get("sh_degree", 3))
+            logger.info(f"Initialized {params.num_gaussians()} Gaussians")
+
+            # Setup optimizer with per-parameter learning rates
+            optimizer = self._create_optimizer(params)
+
+            # Setup densification strategy
+            strategy = DefaultStrategy(
+                refine_start_iter=500,
+                refine_stop_iter=int(iterations * 0.5),
+                refine_every=100,
+                prune_opa=0.005,
+                grow_grad2d=0.0002,
+                grow_scale3d=0.01,
+                prune_scale3d=0.1,
+                pause_refine_after_reset=0,
+                absgrad=False,
+                verbose=True,
+            )
+            strategy_state = strategy.initialize_state()
+
+            # Training loop
+            logger.info(f"Starting training for {iterations} iterations")
+
+            for step in range(1, iterations + 1):
                 if self.cancelled:
-                    self.process.terminate()
                     result["error"] = "Training cancelled"
                     return result
 
-                if progress_callback:
-                    progress_callback(progress)
+                # Pre-backward step for densification
+                strategy.step_pre_backward(
+                    params=self._params_dict(params),
+                    optimizers={"default": optimizer},
+                    state=strategy_state,
+                    step=step,
+                    info={},
+                )
 
-                result["iterations_completed"] = progress.iteration
+                # Random camera selection
+                cam_idx = random.randint(0, num_images - 1)
 
-            # Wait for completion
-            return_code = self.process.wait()
+                # Get camera parameters
+                viewmat = viewmats[cam_idx:cam_idx + 1]  # (1, 4, 4)
+                K = Ks[cam_idx:cam_idx + 1]              # (1, 3, 3)
+                gt_image = images[cam_idx]               # (H, W, 3)
 
-            if return_code == 0:
+                # Render
+                renders, alphas, info = rasterization(
+                    means=params.means,
+                    quats=params.quats / params.quats.norm(dim=-1, keepdim=True),
+                    scales=torch.exp(params.scales),
+                    opacities=torch.sigmoid(params.opacities),
+                    colors=self._sh_to_rgb(params, viewmat),
+                    viewmats=viewmat,
+                    Ks=K,
+                    width=width,
+                    height=height,
+                    packed=False,
+                    render_mode="RGB",
+                )
+
+                # renders shape: (1, H, W, 3)
+                pred_image = renders[0]
+
+                # Compute loss
+                loss = combined_loss(pred_image, gt_image, lambda_l1=0.8, lambda_ssim=0.2)
+
+                # Backward
+                optimizer.zero_grad()
+                loss.backward()
+
+                # Gradient clipping for stability
+                torch.nn.utils.clip_grad_norm_(params.get_params_list(), max_norm=1.0)
+
+                optimizer.step()
+
+                # Post-backward step for densification
+                strategy.step_post_backward(
+                    params=self._params_dict(params),
+                    optimizers={"default": optimizer},
+                    state=strategy_state,
+                    step=step,
+                    info=info,
+                    packed=False,
+                )
+
+                # Update params if densification changed them
+                params = self._update_params_from_dict(params, self._params_dict(params))
+
+                # Progress reporting
+                if step % 100 == 0 or step == 1:
+                    psnr = compute_psnr(pred_image.detach(), gt_image)
+                    elapsed = time.time() - start_time
+
+                    progress = TrainingProgress(
+                        iteration=step,
+                        total_iterations=iterations,
+                        loss=loss.item(),
+                        psnr=psnr,
+                        num_gaussians=params.num_gaussians(),
+                        elapsed_seconds=elapsed,
+                    )
+
+                    logger.info(
+                        f"Step {step}/{iterations}: loss={loss.item():.4f}, "
+                        f"PSNR={psnr:.2f}dB, gaussians={params.num_gaussians()}"
+                    )
+
+                    if progress_callback:
+                        progress_callback(progress)
+
+                    result["iterations_completed"] = step
+                    result["final_loss"] = loss.item()
+                    result["final_psnr"] = psnr
+                    result["num_gaussians"] = params.num_gaussians()
+
+                # Save checkpoints
+                if step in CHECKPOINT_ITERATIONS:
+                    self._log_system_status()
+                    checkpoint_path = output_dir / f"point_cloud_{step}.ply"
+                    if self._save_ply(checkpoint_path, params):
+                        logger.info(f"Saved checkpoint: {checkpoint_path}")
+                    else:
+                        logger.warning(f"Checkpoint save failed: {checkpoint_path}")
+
+                # Yield to event loop periodically
+                if step % 10 == 0:
+                    await asyncio.sleep(0)
+
+            # Save final result
+            self._log_system_status()
+            final_path = output_dir / "point_cloud.ply"
+            if self._save_ply(final_path, params):
+                logger.info(f"Saved final result: {final_path}")
                 result["success"] = True
-                result["output_path"] = str(output_dir / "point_cloud.ply")
+                result["output_path"] = str(final_path)
             else:
-                result["error"] = f"Training failed with code {return_code}"
+                logger.error("Failed to save final PLY - output validation failed")
+                result["success"] = False
+                result["error"] = "Failed to save output file - validation failed"
 
         except Exception as e:
+            logger.exception(f"Training error: {e}")
             result["error"] = str(e)
-            logger.error(f"Training error: {e}")
-
-        finally:
-            self.process = None
 
         return result
 
-    def _write_training_script(
+    def _init_gaussians(
         self,
-        script_path: Path,
-        data_dir: Path,
-        output_dir: Path,
-        iterations: int,
-        preset: Dict[str, Any],
-    ):
-        """Write the gsplat training script."""
-        script = f'''#!/usr/bin/env python3
-"""
-Auto-generated 3D Gaussian Splatting training script.
-Uses gsplat for efficient training.
-"""
+        points: torch.Tensor,
+        sh_degree: int = 3,
+    ) -> GaussianParams:
+        """Initialize Gaussian parameters from point cloud."""
+        num_points = len(points)
 
-import json
-import math
-import os
-import sys
-from pathlib import Path
+        # Positions
+        means = points.clone().requires_grad_(True)
 
-import numpy as np
-import torch
-from PIL import Image
+        # Scales (log-space, initialized small)
+        scales = torch.zeros(num_points, 3, device=self.device)
+        scales.fill_(-3.0)  # exp(-3) ≈ 0.05
+        scales = scales.requires_grad_(True)
 
-# Configuration
-DATA_DIR = Path("{data_dir}")
-OUTPUT_DIR = Path("{output_dir}")
-ITERATIONS = {iterations}
-SH_DEGREE = {preset.get("sh_degree", 3)}
-TARGET_GAUSSIANS = {preset.get("target_gaussians", 500000)}
+        # Rotations (quaternions, initialized to identity)
+        quats = torch.zeros(num_points, 4, device=self.device)
+        quats[:, 0] = 1.0  # w=1, x=y=z=0
+        quats = quats.requires_grad_(True)
 
-# Checkpoint iterations
-SAVE_ITERATIONS = [5000, 10000, 15000, 20000, 25000, 30000]
+        # Opacities (logit-space, initialized to ~0.1)
+        opacities = torch.zeros(num_points, device=self.device)
+        opacities.fill_(-2.2)  # sigmoid(-2.2) ≈ 0.1
+        opacities = opacities.requires_grad_(True)
 
-def load_transforms():
-    """Load camera transforms from JSON."""
-    transforms_path = DATA_DIR / "transforms.json"
-    with open(transforms_path) as f:
-        return json.load(f)
+        # Spherical harmonics DC component (RGB color)
+        sh0 = torch.zeros(num_points, 3, device=self.device)
+        sh0.fill_(0.5)  # Initialize to gray
+        sh0 = sh0.requires_grad_(True)
 
-def load_images(transforms):
-    """Load training images."""
-    images = []
-    for frame in transforms.get("frames", []):
-        img_path = DATA_DIR / frame["file_path"]
-        if not img_path.exists():
-            # Try with extension
-            for ext in [".jpg", ".jpeg", ".png"]:
-                test_path = img_path.with_suffix(ext)
-                if test_path.exists():
-                    img_path = test_path
-                    break
+        # Higher order SH (optional)
+        sh_rest = None
+        if sh_degree > 0:
+            num_sh_coeffs = (sh_degree + 1) ** 2 - 1
+            sh_rest = torch.zeros(num_points, num_sh_coeffs, 3, device=self.device)
+            sh_rest = sh_rest.requires_grad_(True)
 
-        if img_path.exists():
-            img = Image.open(img_path)
-            images.append({{
-                "image": np.array(img),
-                "transform": np.array(frame["transform_matrix"]),
-                "path": str(img_path),
-            }})
+        return GaussianParams(
+            means=means,
+            scales=scales,
+            quats=quats,
+            opacities=opacities,
+            sh0=sh0,
+            sh_rest=sh_rest,
+        )
 
-    return images
+    def _create_optimizer(self, params: GaussianParams) -> torch.optim.Optimizer:
+        """Create Adam optimizer with per-parameter learning rates."""
+        param_groups = [
+            {"params": [params.means], "lr": 0.00016, "name": "means"},
+            {"params": [params.scales], "lr": 0.005, "name": "scales"},
+            {"params": [params.quats], "lr": 0.001, "name": "quats"},
+            {"params": [params.opacities], "lr": 0.05, "name": "opacities"},
+            {"params": [params.sh0], "lr": 0.0025, "name": "sh0"},
+        ]
 
-def initialize_gaussians(num_points, bounds):
-    """Initialize Gaussian point cloud."""
-    # Random initialization within bounds
-    positions = np.random.uniform(bounds[0], bounds[1], (num_points, 3))
+        if params.sh_rest is not None:
+            param_groups.append({
+                "params": [params.sh_rest],
+                "lr": 0.0025 / 20,
+                "name": "sh_rest"
+            })
 
-    # Initialize other parameters
-    scales = np.ones((num_points, 3)) * 0.01
-    rotations = np.zeros((num_points, 4))
-    rotations[:, 0] = 1.0  # Identity quaternion
-    opacities = np.ones((num_points, 1)) * 0.5
-    colors = np.random.uniform(0, 1, (num_points, 3))  # RGB
+        return torch.optim.Adam(param_groups)
 
-    return {{
-        "positions": positions.astype(np.float32),
-        "scales": scales.astype(np.float32),
-        "rotations": rotations.astype(np.float32),
-        "opacities": opacities.astype(np.float32),
-        "colors": colors.astype(np.float32),
-    }}
+    def _params_dict(self, params: GaussianParams) -> Dict[str, torch.Tensor]:
+        """Convert params to dict for gsplat strategy."""
+        d = {
+            "means": params.means,
+            "scales": params.scales,
+            "quats": params.quats,
+            "opacities": params.opacities,
+            "sh0": params.sh0,
+        }
+        if params.sh_rest is not None:
+            d["sh_rest"] = params.sh_rest
+        return d
 
-def save_ply(path, gaussians):
-    """Save Gaussians as PLY file."""
-    from plyfile import PlyData, PlyElement
+    def _update_params_from_dict(
+        self,
+        params: GaussianParams,
+        d: Dict[str, torch.Tensor]
+    ) -> GaussianParams:
+        """Update params from dict (after densification)."""
+        return GaussianParams(
+            means=d["means"],
+            scales=d["scales"],
+            quats=d["quats"],
+            opacities=d["opacities"],
+            sh0=d["sh0"],
+            sh_rest=d.get("sh_rest"),
+        )
 
-    positions = gaussians["positions"]
-    scales = gaussians["scales"]
-    rotations = gaussians["rotations"]
-    opacities = gaussians["opacities"]
-    colors = gaussians["colors"]
+    def _sh_to_rgb(
+        self,
+        params: GaussianParams,
+        viewmat: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Convert spherical harmonics to RGB colors.
+        For now, just return the DC component (view-independent).
+        Full SH evaluation would compute view-dependent colors.
+        """
+        # Simple: just use DC component
+        # Full implementation would evaluate SH with view directions
+        colors = params.sh0
 
-    num_points = len(positions)
+        # Clamp to valid range
+        colors = torch.clamp(colors, 0.0, 1.0)
 
-    # Create structured array
-    dtype = [
-        ("x", "f4"), ("y", "f4"), ("z", "f4"),
-        ("nx", "f4"), ("ny", "f4"), ("nz", "f4"),
-        ("f_dc_0", "f4"), ("f_dc_1", "f4"), ("f_dc_2", "f4"),
-        ("opacity", "f4"),
-        ("scale_0", "f4"), ("scale_1", "f4"), ("scale_2", "f4"),
-        ("rot_0", "f4"), ("rot_1", "f4"), ("rot_2", "f4"), ("rot_3", "f4"),
-    ]
+        return colors
 
-    elements = np.zeros(num_points, dtype=dtype)
-    elements["x"] = positions[:, 0]
-    elements["y"] = positions[:, 1]
-    elements["z"] = positions[:, 2]
-    elements["nx"] = 0
-    elements["ny"] = 0
-    elements["nz"] = 0
-    elements["f_dc_0"] = colors[:, 0]
-    elements["f_dc_1"] = colors[:, 1]
-    elements["f_dc_2"] = colors[:, 2]
-    elements["opacity"] = opacities[:, 0]
-    elements["scale_0"] = np.log(scales[:, 0])
-    elements["scale_1"] = np.log(scales[:, 1])
-    elements["scale_2"] = np.log(scales[:, 2])
-    elements["rot_0"] = rotations[:, 0]
-    elements["rot_1"] = rotations[:, 1]
-    elements["rot_2"] = rotations[:, 2]
-    elements["rot_3"] = rotations[:, 3]
+    def _save_ply(self, path: Path, params: GaussianParams) -> bool:
+        """Save Gaussians as PLY file in 3DGS format with atomic write.
 
-    el = PlyElement.describe(elements, "vertex")
-    PlyData([el]).write(str(path))
-    print(f"Saved PLY: {{path}} ({{num_points}} points)")
+        Returns:
+            True if save and validation succeeded, False otherwise.
+        """
+        from plyfile import PlyData, PlyElement
 
-def train():
-    """Main training loop."""
-    print(f"Loading data from {{DATA_DIR}}")
+        num_points = params.num_gaussians()
 
-    # Load data
-    transforms = load_transforms()
-    images = load_images(transforms)
-    print(f"Loaded {{len(images)}} images")
+        if num_points == 0:
+            logger.error("Cannot save PLY: no Gaussians to save")
+            return False
 
-    if len(images) == 0:
-        print("ERROR: No images loaded!")
-        sys.exit(1)
+        # Detach and move to CPU
+        means = params.means.detach().cpu().numpy()
+        scales = params.scales.detach().cpu().numpy()
+        quats = params.quats.detach().cpu().numpy()
+        opacities = params.opacities.detach().cpu().numpy()
+        sh0 = params.sh0.detach().cpu().numpy()
 
-    # Estimate scene bounds from camera positions
-    camera_positions = [img["transform"][:3, 3] for img in images]
-    camera_positions = np.array(camera_positions)
-    center = camera_positions.mean(axis=0)
-    extent = np.abs(camera_positions - center).max() * 2
+        # Normalize quaternions
+        quats = quats / np.linalg.norm(quats, axis=1, keepdims=True)
 
-    bounds = (center - extent, center + extent)
-    print(f"Scene bounds: {{bounds}}")
+        # Build dtype for PLY
+        dtype = [
+            ("x", "f4"), ("y", "f4"), ("z", "f4"),
+            ("nx", "f4"), ("ny", "f4"), ("nz", "f4"),
+            ("f_dc_0", "f4"), ("f_dc_1", "f4"), ("f_dc_2", "f4"),
+        ]
 
-    # Initialize Gaussians
-    initial_points = min(10000, TARGET_GAUSSIANS // 10)
-    gaussians = initialize_gaussians(initial_points, bounds)
-    print(f"Initialized {{initial_points}} Gaussians")
+        # Add higher-order SH if present
+        if params.sh_rest is not None:
+            sh_rest = params.sh_rest.detach().cpu().numpy()
+            num_sh = sh_rest.shape[1]
+            for i in range(num_sh):
+                for c in range(3):
+                    dtype.append((f"f_rest_{i * 3 + c}", "f4"))
 
-    # Convert to tensors
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {{device}}")
+        dtype.extend([
+            ("opacity", "f4"),
+            ("scale_0", "f4"), ("scale_1", "f4"), ("scale_2", "f4"),
+            ("rot_0", "f4"), ("rot_1", "f4"), ("rot_2", "f4"), ("rot_3", "f4"),
+        ])
 
-    positions = torch.tensor(gaussians["positions"], device=device, requires_grad=True)
-    scales = torch.tensor(gaussians["scales"], device=device, requires_grad=True)
-    rotations = torch.tensor(gaussians["rotations"], device=device, requires_grad=True)
-    opacities = torch.tensor(gaussians["opacities"], device=device, requires_grad=True)
-    colors = torch.tensor(gaussians["colors"], device=device, requires_grad=True)
+        # Create structured array
+        elements = np.zeros(num_points, dtype=dtype)
 
-    # Optimizer
-    optimizer = torch.optim.Adam([
-        {{"params": [positions], "lr": 0.00016}},
-        {{"params": [scales], "lr": 0.005}},
-        {{"params": [rotations], "lr": 0.001}},
-        {{"params": [opacities], "lr": 0.05}},
-        {{"params": [colors], "lr": 0.0025}},
-    ])
+        # Positions
+        elements["x"] = means[:, 0]
+        elements["y"] = means[:, 1]
+        elements["z"] = means[:, 2]
 
-    # Training loop
-    print(f"Starting training for {{ITERATIONS}} iterations")
+        # Normals (unused, but required by format)
+        elements["nx"] = 0
+        elements["ny"] = 0
+        elements["nz"] = 0
 
-    for iteration in range(1, ITERATIONS + 1):
-        optimizer.zero_grad()
+        # DC spherical harmonics (color)
+        # Convert from [0,1] to SH coefficient space
+        C0 = 0.28209479177387814
+        elements["f_dc_0"] = (sh0[:, 0] - 0.5) / C0
+        elements["f_dc_1"] = (sh0[:, 1] - 0.5) / C0
+        elements["f_dc_2"] = (sh0[:, 2] - 0.5) / C0
 
-        # Simple loss (placeholder - real implementation uses differentiable rendering)
-        # This is a simplified version; real gsplat uses proper splatting
-        loss = (positions.mean() - center[0]).pow(2).mean()
+        # Higher-order SH
+        if params.sh_rest is not None:
+            sh_rest = params.sh_rest.detach().cpu().numpy()
+            for i in range(sh_rest.shape[1]):
+                for c in range(3):
+                    elements[f"f_rest_{i * 3 + c}"] = sh_rest[:, i, c]
 
-        loss.backward()
-        optimizer.step()
+        # Opacity (convert from logit to log-space for PLY format)
+        # PLY stores inverse-sigmoid, viewer applies sigmoid
+        elements["opacity"] = opacities
 
-        # Progress
-        if iteration % 100 == 0:
-            print(f"PROGRESS: iteration={{iteration}}, loss={{loss.item():.6f}}, gaussians={{len(positions)}}")
-            sys.stdout.flush()
+        # Scales (already in log-space)
+        elements["scale_0"] = scales[:, 0]
+        elements["scale_1"] = scales[:, 1]
+        elements["scale_2"] = scales[:, 2]
 
-        # Save checkpoints
-        if iteration in SAVE_ITERATIONS or iteration == ITERATIONS:
-            checkpoint_gaussians = {{
-                "positions": positions.detach().cpu().numpy(),
-                "scales": scales.detach().cpu().numpy(),
-                "rotations": rotations.detach().cpu().numpy(),
-                "opacities": opacities.detach().cpu().numpy(),
-                "colors": colors.detach().cpu().numpy(),
-            }}
-            save_ply(OUTPUT_DIR / f"point_cloud_{{iteration}}.ply", checkpoint_gaussians)
+        # Rotations (quaternion wxyz)
+        elements["rot_0"] = quats[:, 0]
+        elements["rot_1"] = quats[:, 1]
+        elements["rot_2"] = quats[:, 2]
+        elements["rot_3"] = quats[:, 3]
 
-    # Save final result
-    final_gaussians = {{
-        "positions": positions.detach().cpu().numpy(),
-        "scales": scales.detach().cpu().numpy(),
-        "rotations": rotations.detach().cpu().numpy(),
-        "opacities": opacities.detach().cpu().numpy(),
-        "colors": colors.detach().cpu().numpy(),
-    }}
-    save_ply(OUTPUT_DIR / "point_cloud.ply", final_gaussians)
+        # Write to temp file first for atomic operation
+        temp_path = path.with_suffix('.ply.tmp')
+        try:
+            el = PlyElement.describe(elements, "vertex")
+            PlyData([el]).write(str(temp_path))
 
-    print("Training completed!")
+            # Validate the temp file before renaming
+            if not self._validate_ply(temp_path, num_points):
+                temp_path.unlink(missing_ok=True)
+                return False
 
-if __name__ == "__main__":
-    train()
-'''
-        with open(script_path, "w") as f:
-            f.write(script)
+            # Atomic rename (move temp to final path)
+            shutil.move(str(temp_path), str(path))
+            logger.info(f"Saved PLY: {path} ({num_points} Gaussians)")
+            return True
 
-        logger.info(f"Wrote training script to {script_path}")
+        except Exception as e:
+            logger.exception(f"Failed to save PLY: {e}")
+            temp_path.unlink(missing_ok=True)
+            return False
 
-    async def _monitor_training(self, total_iterations: int):
-        """Monitor training output and yield progress updates."""
-        if self.process is None:
-            return
+    def _validate_ply(self, path: Path, expected_vertices: int) -> bool:
+        """Verify PLY file is valid and complete.
 
-        pattern = re.compile(r"PROGRESS: iteration=(\d+), loss=([\d.]+), gaussians=(\d+)")
+        Args:
+            path: Path to the PLY file.
+            expected_vertices: Expected number of vertices.
 
-        for line in iter(self.process.stdout.readline, ""):
-            if not line:
-                break
+        Returns:
+            True if valid, False otherwise.
+        """
+        try:
+            if not path.exists():
+                logger.error("PLY validation failed: file doesn't exist")
+                return False
 
-            line = line.strip()
-            if line:
-                logger.debug(f"Training: {line}")
+            file_size = path.stat().st_size
+            # Estimate: ~62 bytes per vertex for standard 3DGS format + ~500 byte header
+            # With SH, can be up to ~250 bytes per vertex
+            expected_min_size = expected_vertices * 50 + 500  # Conservative minimum
 
-            match = pattern.search(line)
-            if match:
-                iteration = int(match.group(1))
-                loss = float(match.group(2))
-                num_gaussians = int(match.group(3))
+            if file_size < expected_min_size * 0.9:  # Allow 10% tolerance
+                logger.error(
+                    f"PLY validation failed: file size {file_size} < expected minimum {expected_min_size}"
+                )
+                return False
 
-                yield TrainingProgress(
-                    iteration=iteration,
-                    total_iterations=total_iterations,
-                    loss=loss,
-                    num_gaussians=num_gaussians,
+            # Try to read back and verify vertex count
+            from plyfile import PlyData
+            plydata = PlyData.read(str(path))
+            actual_vertices = len(plydata["vertex"])
+
+            if actual_vertices != expected_vertices:
+                logger.error(
+                    f"PLY validation failed: {actual_vertices} vertices != expected {expected_vertices}"
+                )
+                return False
+
+            logger.info(f"PLY validated: {actual_vertices} vertices, {file_size} bytes")
+            return True
+
+        except Exception as e:
+            logger.exception(f"PLY validation error: {e}")
+            return False
+
+    def _log_system_status(self):
+        """Log memory and GPU status for diagnostics."""
+        try:
+            if torch.cuda.is_available():
+                allocated = torch.cuda.memory_allocated() / 1024**3
+                reserved = torch.cuda.memory_reserved() / 1024**3
+                total = torch.cuda.get_device_properties(0).total_memory / 1024**3
+                logger.info(
+                    f"GPU Memory: {allocated:.2f}GB allocated, "
+                    f"{reserved:.2f}GB reserved, {total:.2f}GB total"
                 )
 
-            await asyncio.sleep(0)  # Yield control
+            # Log disk space
+            disk = shutil.disk_usage("/")
+            free_gb = disk.free / 1024**3
+            logger.info(f"Disk space: {free_gb:.2f}GB free")
+        except Exception as e:
+            logger.warning(f"Could not log system status: {e}")
 
     def cancel(self):
         """Cancel the current training."""
         self.cancelled = True
-        if self.process:
-            self.process.terminate()
-            logger.info("Training cancelled")
+        logger.info("Training cancellation requested")

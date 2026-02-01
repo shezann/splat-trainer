@@ -90,6 +90,8 @@ class JobManager:
         current_iteration: Optional[int] = None,
         result_url: Optional[str] = None,
         error_message: Optional[str] = None,
+        current_loss: Optional[float] = None,
+        num_gaussians: Optional[int] = None,
     ) -> Optional[TrainingJob]:
         """Update job status and progress."""
         job = self.jobs.get(job_id)
@@ -107,13 +109,26 @@ class JobManager:
             job.result_url = result_url
         if error_message is not None:
             job.error_message = error_message
+        if current_loss is not None:
+            job.current_loss = current_loss
+        if num_gaussians is not None:
+            job.num_gaussians = num_gaussians
 
         if status == JobStatus.training and job.started_at is None:
             job.started_at = datetime.utcnow()
         elif status in (JobStatus.completed, JobStatus.failed, JobStatus.cancelled):
             job.completed_at = datetime.utcnow()
 
-        logger.info(f"Job {job_id}: {status.value} ({job.progress:.1%})")
+        # Verbose logging with additional details
+        log_details = f"Job {job_id}: {status.value} ({job.progress:.1%})"
+        if current_iteration is not None:
+            log_details += f" iter={current_iteration}"
+        if current_loss is not None:
+            log_details += f" loss={current_loss:.4f}"
+        if num_gaussians is not None:
+            log_details += f" gaussians={num_gaussians}"
+        logger.info(log_details)
+
         return job
 
     def queue_job(self, job_id: str) -> bool:
@@ -228,6 +243,8 @@ class JobManager:
                     JobStatus.training,
                     progress=pct,
                     current_iteration=progress.iteration,
+                    current_loss=getattr(progress, 'loss', None),
+                    num_gaussians=getattr(progress, 'num_gaussians', None),
                 )
 
             # Run training
@@ -241,6 +258,17 @@ class JobManager:
             )
 
             if result["success"]:
+                # Verify output file exists and is valid before marking complete
+                output_path = output_dir / "point_cloud.ply"
+                if not self._verify_output(output_path):
+                    self.update_job_status(
+                        job_id,
+                        JobStatus.failed,
+                        error_message="Training completed but output file is invalid or truncated",
+                    )
+                    logger.error(f"Job {job_id} output validation failed")
+                    return
+
                 # Generate download URL
                 result_url = f"/download/{job_id}"
                 self.update_job_status(
@@ -270,6 +298,35 @@ class JobManager:
         finally:
             self.current_job = None
             self.trainer = None
+
+    def _verify_output(self, path) -> bool:
+        """Verify output PLY file exists and has reasonable size.
+
+        Args:
+            path: Path to the output PLY file.
+
+        Returns:
+            True if valid, False otherwise.
+        """
+        from pathlib import Path
+        path = Path(path)
+
+        if not path.exists():
+            logger.error(f"Output verification failed: {path} does not exist")
+            return False
+
+        file_size = path.stat().st_size
+
+        # A valid PLY with even a few thousand gaussians should be > 100KB
+        # 67KB file for 10k gaussians is clearly truncated
+        if file_size < 100_000:  # Less than 100KB is suspicious
+            logger.warning(
+                f"Output file suspiciously small: {file_size} bytes at {path}"
+            )
+            return False
+
+        logger.info(f"Output verified: {path} ({file_size} bytes)")
+        return True
 
 
 # Singleton instance

@@ -3,8 +3,11 @@ Job management API endpoints.
 """
 
 from fastapi import APIRouter, HTTPException, Query, Response
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from typing import Optional, List
+import asyncio
+import json
+import logging
 
 from models.schemas import (
     JobStatus,
@@ -20,6 +23,7 @@ from models.schemas import (
 from services.job_manager import job_manager
 from services.storage import storage_service
 
+logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
@@ -108,6 +112,69 @@ async def get_job(job_id: str):
         raise HTTPException(status_code=404, detail="Job not found")
 
     return JobStatusResponse.from_job(job)
+
+
+@router.get("/{job_id}/stream")
+async def stream_job_status(job_id: str):
+    """
+    Stream real-time job updates via Server-Sent Events (SSE).
+
+    This endpoint provides live progress updates without polling.
+    The client receives events every 2 seconds until the job reaches
+    a terminal state (completed, failed, or cancelled).
+    """
+    logger.info(f"SSE stream started for job {job_id}")
+
+    async def event_generator():
+        try:
+            while True:
+                job = job_manager.get_job(job_id)
+
+                if job is None:
+                    error_data = json.dumps({"error": "Job not found"})
+                    yield f"event: error\ndata: {error_data}\n\n"
+                    logger.warning(f"SSE: Job {job_id} not found")
+                    break
+
+                # Build status data
+                data = {
+                    "status": job.status.value,
+                    "progress": job.progress,
+                    "iteration": job.current_iteration,
+                    "total": job.total_iterations,
+                    "loss": job.current_loss,
+                    "gaussians": job.num_gaussians,
+                    "errorMessage": job.error_message,
+                    "resultURL": job.result_url,
+                }
+                json_data = json.dumps(data)
+                yield f"data: {json_data}\n\n"
+
+                # Check for terminal state
+                if job.status in (JobStatus.completed, JobStatus.failed, JobStatus.cancelled):
+                    logger.info(f"SSE: Job {job_id} reached terminal state: {job.status.value}")
+                    break
+
+                # Wait before next update
+                await asyncio.sleep(2)
+
+        except asyncio.CancelledError:
+            logger.info(f"SSE stream cancelled for job {job_id}")
+            raise
+        except Exception as e:
+            logger.error(f"SSE error for job {job_id}: {e}")
+            error_data = json.dumps({"error": str(e)})
+            yield f"event: error\ndata: {error_data}\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",  # Disable nginx buffering
+        }
+    )
 
 
 @router.get("/{job_id}/full", response_model=TrainingJob)

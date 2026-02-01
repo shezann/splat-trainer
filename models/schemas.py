@@ -68,6 +68,8 @@ class TrainingJob(BaseModel):
     total_iterations: Optional[int] = None
     result_url: Optional[str] = None
     error_message: Optional[str] = None
+    current_loss: Optional[float] = None
+    num_gaussians: Optional[int] = None
     config: TrainingConfig
     created_at: datetime
     updated_at: datetime
@@ -110,12 +112,15 @@ class TrainingJobResponse(BaseModel):
     status: JobStatus
     progress: float
     currentIteration: Optional[int] = None
+    totalIterations: Optional[int] = None
     message: Optional[str] = None
     createdAt: str
     updatedAt: str
     resultURL: Optional[str] = None
     errorMessage: Optional[str] = None
     estimatedTimeRemaining: Optional[float] = None
+    currentLoss: Optional[float] = None
+    numGaussians: Optional[int] = None
     availableCheckpoints: Optional[List[CheckpointInfo]] = None
 
     @classmethod
@@ -125,12 +130,15 @@ class TrainingJobResponse(BaseModel):
             status=job.status,
             progress=job.progress,
             currentIteration=job.current_iteration,
+            totalIterations=job.total_iterations,
             message=f"Iteration {job.current_iteration}/{job.total_iterations}" if job.current_iteration else None,
             createdAt=job.created_at.isoformat(),
             updatedAt=job.updated_at.isoformat(),
             resultURL=job.result_url,
             errorMessage=job.error_message,
             estimatedTimeRemaining=None,
+            currentLoss=job.current_loss,
+            numGaussians=job.num_gaussians,
             availableCheckpoints=None,
         )
 
