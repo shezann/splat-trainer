@@ -280,19 +280,36 @@ def _sample_mesh_points(mesh_path: Path, num_points: int) -> Optional[np.ndarray
     try:
         import trimesh
 
-        mesh = trimesh.load(str(mesh_path))
-        if hasattr(mesh, "sample"):
+        logger.info(f"Loading mesh from {mesh_path}")
+        mesh = trimesh.load(str(mesh_path), force='mesh')
+
+        # Handle Scene objects (GLB files often load as Scene)
+        if isinstance(mesh, trimesh.Scene):
+            logger.info(f"GLB loaded as Scene with {len(mesh.geometry)} geometries")
+            if len(mesh.geometry) == 0:
+                logger.warning("Scene has no geometry")
+                return None
+            # Combine all meshes in the scene
+            meshes = list(mesh.geometry.values())
+            mesh = trimesh.util.concatenate(meshes)
+            logger.info(f"Combined into mesh with {len(mesh.vertices)} vertices")
+
+        if hasattr(mesh, "sample") and hasattr(mesh, "area") and mesh.area > 0:
             points = mesh.sample(num_points)
+            logger.info(f"Sampled {len(points)} points from mesh surface")
             return np.array(points, dtype=np.float32)
-        elif hasattr(mesh, "vertices"):
+        elif hasattr(mesh, "vertices") and len(mesh.vertices) > 0:
             # Just use vertices if can't sample
             vertices = np.array(mesh.vertices, dtype=np.float32)
+            logger.info(f"Using {len(vertices)} mesh vertices directly")
             if len(vertices) > num_points:
                 indices = np.random.choice(len(vertices), num_points, replace=False)
                 return vertices[indices]
             return vertices
+        else:
+            logger.warning(f"Mesh has no usable geometry: {type(mesh)}")
 
     except Exception as e:
-        logger.warning(f"Failed to load mesh {mesh_path}: {e}")
+        logger.exception(f"Failed to load mesh {mesh_path}: {e}")
 
     return None
