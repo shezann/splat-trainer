@@ -202,15 +202,6 @@ class GaussianSplatTrainer:
                     result["error"] = "Training cancelled"
                     return result
 
-                # Pre-backward step for densification
-                strategy.step_pre_backward(
-                    params=self._params_dict(params),
-                    optimizers={"default": optimizer},
-                    state=strategy_state,
-                    step=step,
-                    info={},
-                )
-
                 # Random camera selection
                 cam_idx = random.randint(0, num_images - 1)
 
@@ -237,6 +228,16 @@ class GaussianSplatTrainer:
 
                 # renders shape: (1, H, W, 3)
                 pred_image = renders[0]
+
+                # Pre-backward step for densification - must be after rasterization
+                # to have means2d available, but before loss.backward()
+                strategy.step_pre_backward(
+                    params=self._params_dict(params),
+                    optimizers={"default": optimizer},
+                    state=strategy_state,
+                    step=step,
+                    info=info,
+                )
 
                 # Compute loss
                 loss = combined_loss(pred_image, gt_image, lambda_l1=0.8, lambda_ssim=0.2)
