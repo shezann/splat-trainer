@@ -189,7 +189,7 @@ class GaussianSplatTrainer:
                 grow_scale3d=0.01,
                 prune_scale3d=0.1,
                 pause_refine_after_reset=0,
-                absgrad=False,
+                absgrad=True,  # Must match rasterization absgrad parameter
                 verbose=True,
             )
             strategy_state = strategy.initialize_state()
@@ -219,7 +219,7 @@ class GaussianSplatTrainer:
                 K = Ks[cam_idx:cam_idx + 1]              # (1, 3, 3)
                 gt_image = images[cam_idx]               # (H, W, 3)
 
-                # Render
+                # Render - absgrad=True required for DefaultStrategy densification
                 renders, alphas, info = rasterization(
                     means=params.means,
                     quats=params.quats / params.quats.norm(dim=-1, keepdim=True),
@@ -232,6 +232,7 @@ class GaussianSplatTrainer:
                     height=height,
                     packed=False,
                     render_mode="RGB",
+                    absgrad=True,
                 )
 
                 # renders shape: (1, H, W, 3)
