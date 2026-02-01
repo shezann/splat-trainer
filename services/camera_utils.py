@@ -231,7 +231,7 @@ def _initialize_points_from_cameras(
                 return torch.tensor(points, device=device, dtype=torch.float32)
 
     # Try to sample points from mesh
-    mesh_files = ["mesh.ply", "mesh.glb", "mesh.obj"]
+    mesh_files = ["mesh.ply", "mesh.glb", "mesh.obj", "mesh_hint.ply"]
     for filename in mesh_files:
         mesh_path = data_dir / filename
         if mesh_path.exists():
