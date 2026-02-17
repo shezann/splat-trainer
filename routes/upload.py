@@ -156,10 +156,18 @@ async def download_result(job_id: str):
     if result_path is None or not result_path.exists():
         raise HTTPException(status_code=404, detail="Result file not found")
 
+    # Set appropriate media type and filename based on file extension
+    if result_path.suffix == ".glb":
+        media_type = "model/gltf-binary"
+        filename = f"{job_id}_gaussians.glb"
+    else:
+        media_type = "application/octet-stream"
+        filename = f"{job_id}_gaussians.ply"
+
     return FileResponse(
         path=result_path,
-        filename=f"{job_id}_gaussians.ply",
-        media_type="application/octet-stream",
+        filename=filename,
+        media_type=media_type,
     )
 
 

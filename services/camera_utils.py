@@ -1,10 +1,11 @@
 """
 Camera and image loading utilities for 3DGS training.
-Handles NeRF-style transforms.json format from iOS capture.
+Handles NeRF-style transforms.json format and COLMAP sparse reconstructions.
 """
 
 import json
 import logging
+import os
 from pathlib import Path
 from typing import Tuple, Optional
 
@@ -21,10 +22,10 @@ def load_training_data(
     image_scale: float = 1.0,
 ) -> dict:
     """
-    Load cameras and images from transforms.json (NeRF format).
+    Load cameras and images, auto-detecting format (COLMAP or NeRF).
 
     Args:
-        data_dir: Directory containing transforms.json and images
+        data_dir: Directory containing training data
         device: Torch device for tensors
         image_scale: Scale factor for images (0.5 = half resolution)
 
@@ -37,10 +38,203 @@ def load_training_data(
             - width: image width
             - height: image height
     """
+    # Check for COLMAP format first
+    if (data_dir / "sparse" / "0" / "cameras.bin").exists():
+        logger.info("Detected COLMAP format")
+        return load_colmap_data(data_dir, device, image_scale)
+
+    # Fall back to NeRF transforms.json
     transforms_path = data_dir / "transforms.json"
     if not transforms_path.exists():
-        raise FileNotFoundError(f"transforms.json not found in {data_dir}")
+        raise FileNotFoundError(
+            f"No training data found in {data_dir}. "
+            f"Expected COLMAP (sparse/0/cameras.bin) or NeRF (transforms.json)."
+        )
 
+    logger.info("Detected NeRF format")
+    return _load_nerf_data(data_dir, device, image_scale)
+
+
+def load_colmap_data(
+    data_dir: Path,
+    device: torch.device = torch.device("cuda"),
+    image_scale: float = 1.0,
+) -> dict:
+    """
+    Load cameras and images from COLMAP sparse reconstruction.
+
+    Expects:
+        data_dir/sparse/0/cameras.bin
+        data_dir/sparse/0/images.bin
+        data_dir/sparse/0/points3D.bin
+        data_dir/images/  (training images)
+    """
+    from services.colmap_loader import (
+        read_cameras_binary,
+        read_images_binary,
+        read_points3D_binary,
+        get_intrinsics,
+        qvec2rotmat,
+    )
+
+    sparse_dir = data_dir / "sparse" / "0"
+
+    # Read COLMAP binary files
+    cameras = read_cameras_binary(sparse_dir / "cameras.bin")
+    colmap_images = read_images_binary(sparse_dir / "images.bin")
+    xyzs, rgbs = read_points3D_binary(sparse_dir / "points3D.bin")
+
+    # Find images directory
+    images_dir = data_dir / "images"
+    if not images_dir.exists():
+        raise FileNotFoundError(f"Images directory not found: {images_dir}")
+
+    # Determine image dimensions from the first image
+    first_colmap_img = next(iter(colmap_images.values()))
+    first_image_path = images_dir / first_colmap_img.name
+    if not first_image_path.exists():
+        # Try common subdirectories
+        for subdir in ["", "images_2", "images_4", "images_8"]:
+            test_dir = data_dir / subdir if subdir else images_dir
+            test_path = test_dir / first_colmap_img.name
+            if test_path.exists():
+                images_dir = test_dir
+                first_image_path = test_path
+                break
+        else:
+            raise FileNotFoundError(
+                f"Could not find image: {first_colmap_img.name} in {images_dir}"
+            )
+
+    with Image.open(first_image_path) as img:
+        orig_width, orig_height = img.size
+
+    width = int(orig_width * image_scale)
+    height = int(orig_height * image_scale)
+
+    # COLMAP cameras.bin stores intrinsics at the original capture resolution,
+    # but images on disk may already be downscaled (e.g. half-res).  Compute
+    # the total scale from COLMAP camera resolution to our final render size.
+    first_camera = cameras[next(iter(colmap_images.values())).camera_id]
+    colmap_width = first_camera.width
+    disk_scale = orig_width / colmap_width  # ratio of image-on-disk to COLMAP res
+    intrinsics_scale = disk_scale * image_scale  # total scale for intrinsics
+    if abs(disk_scale - 1.0) > 0.01:
+        logger.info(
+            "Images on disk (%dx%d) differ from COLMAP camera (%dx%d), "
+            "disk_scale=%.4f, total intrinsics_scale=%.4f",
+            orig_width, orig_height, colmap_width, first_camera.height,
+            disk_scale, intrinsics_scale,
+        )
+
+    # Build camera matrices and load images
+    viewmats = []
+    Ks = []
+    loaded_images = []
+    camera_centers = []
+
+    # Sort images by ID for deterministic ordering
+    for image_id in sorted(colmap_images.keys()):
+        colmap_img = colmap_images[image_id]
+        camera = cameras[colmap_img.camera_id]
+
+        # Find and load the image file
+        image_path = images_dir / colmap_img.name
+        if not image_path.exists():
+            logger.warning(f"Skipping missing image: {colmap_img.name}")
+            continue
+
+        with Image.open(image_path) as img:
+            if img.mode != "RGB":
+                img = img.convert("RGB")
+            if image_scale != 1.0:
+                img = img.resize((width, height), Image.LANCZOS)
+            image_np = np.array(img, dtype=np.float32) / 255.0
+
+        loaded_images.append(image_np)
+
+        # Build world-to-camera matrix directly from COLMAP qvec/tvec
+        # COLMAP stores world-to-camera rotation and translation directly
+        R = qvec2rotmat(colmap_img.qvec)
+        t = colmap_img.tvec
+
+        w2c = np.eye(4, dtype=np.float32)
+        w2c[:3, :3] = R
+        w2c[:3, 3] = t
+        viewmats.append(w2c)
+        camera_centers.append(-(R.T @ t))
+
+        # Build intrinsic matrix scaled from COLMAP resolution to our render size
+        fx, fy, cx, cy = get_intrinsics(camera, scale=intrinsics_scale)
+        K = np.array([
+            [fx, 0, cx],
+            [0, fy, cy],
+            [0, 0, 1],
+        ], dtype=np.float32)
+        Ks.append(K)
+
+    if len(loaded_images) == 0:
+        raise ValueError("No valid images found")
+
+    logger.info(f"Loaded {len(loaded_images)} images at {width}x{height}")
+    logger.info(f"Initial SfM points: {len(xyzs)}")
+
+    scene_center, scene_scale = _estimate_scene_from_camera_positions(
+        np.asarray(camera_centers, dtype=np.float32)
+    )
+
+    # COLMAP sparse points often include very far outliers. Keep a robust subset
+    # near the camera orbit to stabilize early training.
+    init_points_np = xyzs.astype(np.float32)
+    init_colors_np = np.clip(rgbs.astype(np.float32) / 255.0, 0.0, 1.0)
+    radius_mult = float(os.environ.get("SPLAT_INIT_POINT_RADIUS_MULT", "4.0"))
+    if len(init_points_np) > 0 and scene_scale > 0:
+        dists = np.linalg.norm(init_points_np - scene_center[None, :], axis=1)
+        keep = dists <= (scene_scale * radius_mult)
+        min_keep = max(1000, int(len(init_points_np) * 0.1))
+        if int(keep.sum()) >= min_keep:
+            dropped = len(init_points_np) - int(keep.sum())
+            if dropped > 0:
+                logger.info(
+                    "Filtered %d sparse outlier points (radius_mult=%.2f, scene_scale=%.3f)",
+                    dropped,
+                    radius_mult,
+                    scene_scale,
+                )
+            init_points_np = init_points_np[keep]
+            init_colors_np = init_colors_np[keep]
+
+    # Convert to tensors
+    viewmats = torch.tensor(np.stack(viewmats), device=device, dtype=torch.float32)
+    Ks = torch.tensor(np.stack(Ks), device=device, dtype=torch.float32)
+    images_tensor = torch.tensor(
+        np.stack(loaded_images), device=device, dtype=torch.float32
+    )
+
+    # Use real SfM points/colors from COLMAP for initialization.
+    initial_points = torch.tensor(init_points_np, device=device, dtype=torch.float32)
+    initial_colors = torch.tensor(init_colors_np, device=device, dtype=torch.float32)
+
+    return {
+        "viewmats": viewmats,
+        "Ks": Ks,
+        "images": images_tensor,
+        "initial_points": initial_points,
+        "initial_colors": initial_colors,
+        "scene_center": torch.tensor(scene_center, device=device, dtype=torch.float32),
+        "scene_scale": float(scene_scale),
+        "width": width,
+        "height": height,
+    }
+
+
+def _load_nerf_data(
+    data_dir: Path,
+    device: torch.device = torch.device("cuda"),
+    image_scale: float = 1.0,
+) -> dict:
+    """Load cameras and images from transforms.json (NeRF format)."""
+    transforms_path = data_dir / "transforms.json"
     with open(transforms_path) as f:
         transforms = json.load(f)
 
@@ -150,6 +344,10 @@ def load_training_data(
     Ks = torch.tensor(np.stack(Ks), device=device, dtype=torch.float32)
     images = torch.tensor(np.stack(images), device=device, dtype=torch.float32)
 
+    scene_center, scene_scale = _estimate_scene_from_camera_positions(
+        np.asarray(camera_positions, dtype=np.float32)
+    )
+
     # Initialize points from camera frustums or mesh
     initial_points = _initialize_points_from_cameras(
         camera_positions, data_dir, device
@@ -160,9 +358,30 @@ def load_training_data(
         "Ks": Ks,
         "images": images,
         "initial_points": initial_points,
+        "initial_colors": None,
+        "scene_center": torch.tensor(scene_center, device=device, dtype=torch.float32),
+        "scene_scale": float(scene_scale),
         "width": width,
         "height": height,
     }
+
+
+def _estimate_scene_from_camera_positions(
+    camera_positions: np.ndarray,
+) -> Tuple[np.ndarray, float]:
+    """
+    Estimate scene center and scale from camera centers.
+
+    Matches the spirit of reference 3DGS normalization (radius around cameras).
+    """
+    if camera_positions.size == 0:
+        return np.zeros(3, dtype=np.float32), 1.0
+
+    center = camera_positions.mean(axis=0).astype(np.float32)
+    dists = np.linalg.norm(camera_positions - center[None, :], axis=1)
+    radius = float(dists.max()) if len(dists) > 0 else 1.0
+    scene_scale = max(radius * 1.1, 1e-3)
+    return center, scene_scale
 
 
 def _resolve_image_path(data_dir: Path, file_path: str) -> Optional[Path]:

@@ -82,7 +82,7 @@ class StorageService:
         }
 
     def _validate_extracted_data(self, extract_dir: Path) -> Dict[str, Any]:
-        """Validate extracted training data."""
+        """Validate extracted training data (NeRF or COLMAP format)."""
         result = {
             "valid": True,
             "errors": [],
@@ -97,12 +97,24 @@ class StorageService:
             result["errors"].append("Could not find valid data directory")
             return result
 
-        # Check for transforms.json
-        transforms_path = data_dir / "transforms.json"
-        if not transforms_path.exists():
-            result["valid"] = False
-            result["errors"].append("Missing transforms.json")
+        # Detect format
+        has_colmap = (data_dir / "sparse" / "0" / "cameras.bin").exists()
+        has_nerf = (data_dir / "transforms.json").exists()
+
+        if has_colmap:
+            result["stats"]["format"] = "colmap"
+        elif has_nerf:
+            result["stats"]["format"] = "nerf"
         else:
+            result["valid"] = False
+            result["errors"].append(
+                "Missing training data: need transforms.json (NeRF) "
+                "or sparse/0/cameras.bin (COLMAP)"
+            )
+
+        # Check for transforms.json (NeRF only)
+        if has_nerf and not has_colmap:
+            transforms_path = data_dir / "transforms.json"
             try:
                 with open(transforms_path) as f:
                     transforms = json.load(f)
@@ -131,8 +143,10 @@ class StorageService:
 
     def _find_data_dir(self, extract_dir: Path) -> Optional[Path]:
         """Find the actual data directory within extracted files."""
-        # Check if transforms.json is directly in extract_dir
+        # Check if transforms.json or COLMAP data is directly in extract_dir
         if (extract_dir / "transforms.json").exists():
+            return extract_dir
+        if (extract_dir / "sparse" / "0" / "cameras.bin").exists():
             return extract_dir
 
         # Check one level deep
@@ -140,12 +154,16 @@ class StorageService:
             if subdir.is_dir():
                 if (subdir / "transforms.json").exists():
                     return subdir
+                if (subdir / "sparse" / "0" / "cameras.bin").exists():
+                    return subdir
 
         # Check for images directory pattern
         for subdir in extract_dir.rglob("images"):
             if subdir.is_dir():
                 parent = subdir.parent
                 if (parent / "transforms.json").exists():
+                    return parent
+                if (parent / "sparse" / "0" / "cameras.bin").exists():
                     return parent
 
         return None
@@ -178,11 +196,12 @@ class StorageService:
         return sorted(checkpoints, key=lambda x: x["iteration"])
 
     def get_final_result(self, job_id: str) -> Optional[Path]:
-        """Get the final PLY result for a job."""
+        """Get the final result for a job, preferring GLB over PLY."""
         output_dir = self.get_job_output_dir(job_id)
 
-        # Look for final output
+        # Look for final output, preferring GLB
         candidates = [
+            output_dir / "point_cloud.glb",
             output_dir / "point_cloud.ply",
             output_dir / "final.ply",
             output_dir / "splat.ply",
