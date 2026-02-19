@@ -45,11 +45,14 @@ async def list_available_downloads(
         result_path = storage_service.get_final_result(job.id)
         if result_path and result_path.exists():
             file_size = result_path.stat().st_size
+            mesh_path = storage_service.get_mesh_result(job.id)
             downloads.append({
                 "jobId": job.id,
                 "scanId": job.scan_id,
                 "name": job.scan_id or job.id,
                 "downloadURL": f"/download/{job.id}",
+                "meshDownloadURL": f"/download/{job.id}/mesh" if mesh_path else None,
+                "hasMesh": mesh_path is not None,
                 "fileSize": file_size,
                 "fileSizeMB": round(file_size / 1024 / 1024, 2),
                 "completedAt": job.updated_at.isoformat() if job.updated_at else None,

@@ -260,6 +260,22 @@ def _load_nerf_data(
     width = int(orig_width * image_scale)
     height = int(orig_height * image_scale)
 
+    # Intrinsics in transforms.json may reference a different resolution than
+    # the actual images on disk (e.g. iOS exports intrinsics for 2160x3840
+    # but saves images at 1080x1920). Compute the ratio to correct for this.
+    json_w = transforms.get("w", orig_width)
+    json_h = transforms.get("h", orig_height)
+    res_scale_x = orig_width / json_w
+    res_scale_y = orig_height / json_h
+    if res_scale_x != 1.0 or res_scale_y != 1.0:
+        logger.info(f"Resolution mismatch: images {orig_width}x{orig_height}, "
+                     f"transforms.json {json_w}x{json_h}, "
+                     f"scale=({res_scale_x:.3f}, {res_scale_y:.3f})")
+
+    # Total scale: resolution mismatch * user-requested downscale
+    total_scale_x = res_scale_x * image_scale
+    total_scale_y = res_scale_y * image_scale
+
     # Compute focal lengths from FOV
     fx = width / (2 * np.tan(camera_angle_x / 2))
     if camera_angle_y is not None:
@@ -267,18 +283,18 @@ def _load_nerf_data(
     else:
         fy = fx  # Assume square pixels
 
-    # Check for per-frame intrinsics (some iOS exports include these)
+    # Check for explicit intrinsics (overrides FOV-based calculation)
     fl_x = transforms.get("fl_x")
     fl_y = transforms.get("fl_y")
-    cx = transforms.get("cx", width / 2)
-    cy = transforms.get("cy", height / 2)
+    cx_val = transforms.get("cx")
+    cy_val = transforms.get("cy")
 
     if fl_x is not None:
-        fx = fl_x * image_scale
+        fx = fl_x * total_scale_x
     if fl_y is not None:
-        fy = fl_y * image_scale
-    cx = cx * image_scale
-    cy = cy * image_scale
+        fy = fl_y * total_scale_y
+    cx = cx_val * total_scale_x if cx_val is not None else width / 2
+    cy = cy_val * total_scale_y if cy_val is not None else height / 2
 
     logger.info(f"Camera intrinsics: fx={fx:.1f}, fy={fy:.1f}, cx={cx:.1f}, cy={cy:.1f}")
 
@@ -304,28 +320,28 @@ def _load_nerf_data(
 
         images.append(image_np)
 
-        # Parse transform matrix (camera-to-world, c2w)
+        # Parse transform matrix (camera-to-world, c2w).
+        # iOS/ARKit exports use OpenCV convention (camera looks along +Z),
+        # which matches gsplat's rasterizer.  No axis flip is needed.
         c2w = np.array(frame["transform_matrix"], dtype=np.float32)
 
         # Convert to world-to-camera (w2c) for gsplat
-        # gsplat expects w2c matrices
         w2c = np.linalg.inv(c2w)
         viewmats.append(w2c)
 
-        # Store camera position for point cloud initialization
+        # Store camera position (column 3 of the c2w matrix)
         camera_positions.append(c2w[:3, 3])
 
-        # Per-frame intrinsics (if available)
-        frame_fx = frame.get("fl_x", fx)
-        frame_fy = frame.get("fl_y", fy)
-        frame_cx = frame.get("cx", cx)
-        frame_cy = frame.get("cy", cy)
+        # Per-frame intrinsics (if available), scaled to actual render resolution
+        pf_fx = frame.get("fl_x")
+        pf_fy = frame.get("fl_y")
+        pf_cx = frame.get("cx")
+        pf_cy = frame.get("cy")
 
-        if frame.get("fl_x") is not None:
-            frame_fx *= image_scale
-            frame_fy = frame.get("fl_y", frame_fx) * image_scale
-            frame_cx = frame.get("cx", width / 2) * image_scale
-            frame_cy = frame.get("cy", height / 2) * image_scale
+        frame_fx = pf_fx * total_scale_x if pf_fx is not None else fx
+        frame_fy = pf_fy * total_scale_y if pf_fy is not None else fy
+        frame_cx = pf_cx * total_scale_x if pf_cx is not None else cx
+        frame_cy = pf_cy * total_scale_y if pf_cy is not None else cy
 
         K = np.array([
             [frame_fx, 0, frame_cx],

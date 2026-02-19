@@ -189,6 +189,20 @@ class GaussianSplatTrainer:
         start_time = time.time()
 
         try:
+            # Export iOS LiDAR mesh to GLB before training starts.
+            # mesh_hint.ply is produced by ARKit scene reconstruction and is a
+            # real triangle mesh of the room — completely separate from the
+            # Gaussian splat we train. Export it immediately so the caller can
+            # download a clean room mesh even if training is still running.
+            try:
+                from services.mesh_utils import export_ios_mesh_glb
+                mesh_glb = export_ios_mesh_glb(data_dir, output_dir)
+                if mesh_glb:
+                    result["mesh_output_path"] = str(mesh_glb)
+                    logger.info(f"Room mesh GLB ready: {mesh_glb}")
+            except Exception as mesh_exc:
+                logger.warning(f"Mesh export skipped: {mesh_exc}")
+
             # Import gsplat
             try:
                 from gsplat.rendering import rasterization
@@ -340,8 +354,23 @@ class GaussianSplatTrainer:
                     info=info,
                 )
 
-                # Compute loss
+                # Compute reconstruction loss
                 loss = combined_loss(pred_image, gt_image, lambda_l1=0.8, lambda_ssim=0.2)
+
+                # Scale anisotropy regularization — the primary cause of shard/needle
+                # artifacts in iOS room scans.  Without this, 50%+ of Gaussians can
+                # become razor-thin discs (aspect ratio >10,000) after densification
+                # stops, since nothing prevents the optimizer from flattening them.
+                #
+                # Penalty: mean difference between max and min log-scale per Gaussian.
+                # A perfect sphere has diff=0; a razor disc has a very large diff.
+                # Weight 0.01 keeps it well below the reconstruction loss while still
+                # strongly discouraging degenerate shapes.
+                scales = strategy_params["scales"]
+                scale_aniso_reg = (
+                    scales.max(dim=1).values - scales.min(dim=1).values
+                ).mean()
+                loss = loss + 0.01 * scale_aniso_reg
 
                 # Backward
                 for opt in optimizers.values():

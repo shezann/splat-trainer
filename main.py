@@ -11,6 +11,7 @@ from contextlib import asynccontextmanager
 import logging
 import uuid
 import time
+import setup_build_env  # noqa: F401 - configures ninja + MSVC for gsplat
 
 from routes import jobs, upload
 from services.job_manager import job_manager

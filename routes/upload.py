@@ -137,6 +137,35 @@ async def upload_training_data(
         )
 
 
+@router.get("/download/{job_id}/mesh")
+async def download_mesh(job_id: str):
+    """
+    Download the room mesh GLB produced from the iOS LiDAR/ARKit scan data.
+
+    This is a real triangle mesh of the room (not a Gaussian splat).
+    Available as soon as the job starts processing (before training completes).
+    """
+    job = job_manager.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    mesh_path = storage_service.get_mesh_result(job_id)
+    if mesh_path is None or not mesh_path.exists():
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                "Mesh file not found. The iOS scan data may not include "
+                "a LiDAR mesh (mesh_hint.ply), or the job has not started yet."
+            ),
+        )
+
+    return FileResponse(
+        path=mesh_path,
+        filename=f"{job_id}_room_mesh.glb",
+        media_type="model/gltf-binary",
+    )
+
+
 @router.get("/download/{job_id}")
 async def download_result(job_id: str):
     """

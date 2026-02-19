@@ -22,6 +22,8 @@ import sys
 import time
 from pathlib import Path
 
+import setup_build_env  # noqa: F401 - configures ninja + MSVC for gsplat
+
 import numpy as np
 import torch
 

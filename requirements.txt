@@ -10,6 +10,7 @@ aiofiles==23.2.1
 torch>=2.1.0
 torchvision
 gsplat>=1.0.0
+ninja  # Required for gsplat JIT compilation of CUDA kernels
 
 # 3D processing
 numpy>=1.24.0

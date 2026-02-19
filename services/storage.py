@@ -195,6 +195,14 @@ class StorageService:
 
         return sorted(checkpoints, key=lambda x: x["iteration"])
 
+    def get_mesh_result(self, job_id: str) -> Optional[Path]:
+        """Get the room mesh GLB (from iOS LiDAR/ARKit data) for a job."""
+        output_dir = self.get_job_output_dir(job_id)
+        mesh_path = output_dir / "mesh.glb"
+        if mesh_path.exists():
+            return mesh_path
+        return None
+
     def get_final_result(self, job_id: str) -> Optional[Path]:
         """Get the final result for a job, preferring GLB over PLY."""
         output_dir = self.get_job_output_dir(job_id)
