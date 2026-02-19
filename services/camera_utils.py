@@ -321,16 +321,21 @@ def _load_nerf_data(
         images.append(image_np)
 
         # Parse transform matrix (camera-to-world, c2w).
-        # iOS/ARKit exports use OpenCV convention (camera looks along +Z),
-        # which matches gsplat's rasterizer.  No axis flip is needed.
+        # iOS/ARKit and Polycam export in OpenGL convention (Y up,
+        # camera looks along -Z).  gsplat expects OpenCV convention
+        # (Y down, camera looks along +Z).  Flip Y and Z axes.
         c2w = np.array(frame["transform_matrix"], dtype=np.float32)
+
+        # Store camera position *before* the axis flip (translation is
+        # convention-independent).
+        camera_positions.append(c2w[:3, 3].copy())
+
+        # OpenGL → OpenCV: negate Y and Z columns of the rotation part.
+        c2w[:3, 1:3] *= -1
 
         # Convert to world-to-camera (w2c) for gsplat
         w2c = np.linalg.inv(c2w)
         viewmats.append(w2c)
-
-        # Store camera position (column 3 of the c2w matrix)
-        camera_positions.append(c2w[:3, 3])
 
         # Per-frame intrinsics (if available), scaled to actual render resolution
         pf_fx = frame.get("fl_x")
