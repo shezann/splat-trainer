@@ -321,19 +321,17 @@ def _load_nerf_data(
         images.append(image_np)
 
         # Parse transform matrix (camera-to-world, c2w).
-        # iOS/ARKit and Polycam export in OpenGL convention (Y up,
-        # camera looks along -Z).  gsplat expects OpenCV convention
-        # (Y down, camera looks along +Z).  Flip Y and Z axes.
+        # iOS now exports camera.transform directly (raw pose without interface
+        # orientation adjustments). The previous viewMatrix(for: .landscapeRight)
+        # approach added rotations that didn't match the pixel buffer orientation.
+        # With raw camera.transform, no coordinate flip is needed - the pose and
+        # intrinsics are both in the native camera coordinate system.
         c2w = np.array(frame["transform_matrix"], dtype=np.float32)
 
-        # Store camera position *before* the axis flip (translation is
-        # convention-independent).
+        # Store camera position for scene scale estimation
         camera_positions.append(c2w[:3, 3].copy())
 
-        # OpenGL → OpenCV: negate Y and Z columns of the rotation part.
-        c2w[:3, 1:3] *= -1
-
-        # Convert to world-to-camera (w2c) for gsplat
+        # Convert to world-to-camera (w2c) for gsplat - no flip needed
         w2c = np.linalg.inv(c2w)
         viewmats.append(w2c)
 
@@ -435,7 +433,7 @@ def _initialize_points_from_cameras(
     camera_positions: list,
     data_dir: Path,
     device: torch.device,
-    num_random_points: int = 10000,
+    num_random_points: int = 100000,
 ) -> torch.Tensor:
     """
     Initialize 3D points for Gaussian splatting.
@@ -470,8 +468,8 @@ def _initialize_points_from_cameras(
                 logger.info(f"Loaded {len(points)} points from {filename}")
                 return torch.tensor(points, device=device, dtype=torch.float32)
 
-    # Try to sample points from mesh
-    mesh_files = ["mesh.ply", "mesh.glb", "mesh.obj", "mesh_hint.ply"]
+    # Try to sample points from mesh (prioritize iOS mesh_hint.ply)
+    mesh_files = ["mesh_hint.ply", "mesh.ply", "mesh.glb", "mesh.obj"]
     for filename in mesh_files:
         mesh_path = data_dir / filename
         if mesh_path.exists():
